@@ -1,0 +1,526 @@
+#################################################GRACE CSR PROCESSING
+
+
+# Load necessary libraries
+library(ncdf4)       # For working with NetCDF data
+library(dplyr)       # For data manipulation
+library(zoo)         # For handling time series data
+library(imputeTS)    # For Kalman filtering
+library(ggplot2)     # For Loess interpolation
+
+# Function to apply Loess smoothing
+apply_loess_smoothing <- function(data, span = 0.75) {
+  valid_data <- data[!is.na(data)]
+  dates <- seq_along(valid_data)  # Create a sequence of numeric indices for Loess fitting
+  
+  if(length(valid_data) < 2) {
+    return(data)  # Return original data if insufficient data points for Loess
+  }
+  
+  loess_fit <- loess(valid_data ~ dates, span = span)
+  smoothed_values <- predict(loess_fit, newdata = seq_along(data))
+  
+  # Return the interpolated data, preserving NAs for original missing values
+  return(smoothed_values)
+}
+
+# Function to apply Kalman filtering
+apply_kalman_filtering <- function(data) {
+  # Apply Kalman filtering
+  kalman_filtered <- na_kalman(data)
+  return(kalman_filtered)
+}
+
+# Function to extract data chunk by chunk to prevent memory overload
+process_grace_data_chunked <- function(nc_file, lon_min, lon_max, lat_min, lat_max) {
+  
+  # Open NetCDF file
+  nc_data <- nc_open(nc_file)
+  
+  # Get dimensions
+  lon <- ncvar_get(nc_data, "lon")   # Extract longitude
+  lat <- ncvar_get(nc_data, "lat")   # Extract latitude
+  time <- ncvar_get(nc_data, "time") # Extract time
+  start_date <- as.Date("2002-01-01")
+  dates <- start_date + time         # Convert time to dates
+  
+  # Subset lat and lon to focus on Kenya region
+  lon_indices <- which(lon >= lon_min & lon <= lon_max)
+  lat_indices <- which(lat >= lat_min & lat <= lat_max)
+  
+  # Initialize an empty dataframe to store results
+  final_df <- data.frame()
+
+  # Loop through chunks of longitude (lon_indices)
+  for (lon_idx in lon_indices) {
+    # Extract lwe_thickness data chunk for specific longitude
+    lwe_thickness_chunk <- ncvar_get(nc_data, "lwe_thickness", start = c(lon_idx, 1, 1),
+                                     count = c(1, length(lat_indices), length(time)))
+    
+    # Reshape chunk into a data frame
+    chunk_df <- expand.grid(lon = lon[lon_idx], lat = lat[lat_indices], date = dates) %>%
+      mutate(lwe_thickness = as.vector(lwe_thickness_chunk))
+    
+    # Apply Loess smoothing
+    chunk_df <- chunk_df %>%
+      group_by(lat) %>%
+      mutate(lwe_thickness_smoothed = apply_loess_smoothing(lwe_thickness, span = 0.75)) %>%
+      ungroup()
+    
+    # Apply Kalman filtering to the smoothed data
+    chunk_df <- chunk_df %>%
+      group_by(lat) %>%
+      mutate(lwe_thickness_interpolated = apply_kalman_filtering(lwe_thickness_smoothed)) %>%
+      ungroup()
+
+    # Drop the intermediate smoothed column
+    chunk_df <- select(chunk_df, -lwe_thickness_smoothed)
+
+    # Append chunk to final_df
+    final_df <- bind_rows(final_df, chunk_df)
+    
+    # Clean up memory after each iteration
+    rm(chunk_df, lwe_thickness_chunk)
+    gc()  # Run garbage collection to free up memory
+  }
+
+  # Close NetCDF file
+  nc_close(nc_data)
+  
+  return(final_df)
+}
+
+# Define the Kenya region boundaries
+lon_min <- 33
+lon_max <- 42
+lat_min <- -5
+lat_max <- 5
+
+# Process the GRACE data for Kenya using chunked extraction, Loess smoothing, and Kalman filtering
+kenya_lwe_df <- process_grace_data_chunked("CSR_GRACE_GRACE-FO_RL0602_Mascons_all-corrections.nc",
+                                            lon_min, lon_max, lat_min, lat_max)
+
+# Save the processed data to a CSV file
+write.csv(kenya_lwe_df, "kenya_lwe_processed_chunked_loess_kalman.csv", row.names = FALSE)
+
+# Perform final garbage collection
+gc()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################WITHOUT INTERPOLATION
+
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+
+# Load the data
+data <- read.csv("kenya_lwe_processed_chunked_loess_kalman.csv")
+
+# Inspect the data
+head(data)
+summary(data)
+
+# Check for negative LWE thickness values
+negative_lwe <- data %>% filter(lwe_thickness < 0)
+print(negative_lwe)
+
+# Determine which column to use
+# Let's assume 'lwe_thickness' is the original column and 'lwe_thickness_interpolated' is the interpolated column.
+
+# Option 1: Use original LWE thickness
+analysis_data <- data %>%
+  select(lon, lat, date, lwe_thickness)
+
+# Option 2: Use interpolated values if you prefer smoothing
+# analysis_data <- data %>%
+#   select(lon, lat, date, lwe_thickness_interpolated)
+
+# Example analysis: Plot LWE thickness over time for a specific location
+plot_data <- data %>%
+  filter(lon == specific_lon_value & lat == specific_lat_value) %>%
+  select(date, lwe_thickness)  # Replace 'lwe_thickness' with 'lwe_thickness_interpolated' if needed
+
+ggplot(plot_data, aes(x = date, y = lwe_thickness)) +
+  geom_line() +
+  labs(title = "LWE Thickness Over Time",
+       x = "Date",
+       y = "LWE Thickness (cm)")
+
+# Save the analysis data to a new CSV if needed
+write.csv(analysis_data, "kenya_lwe_final_analysis.csv", row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+#######################################################lwe & anomaly visualization for Kenya
+
+
+
+# Load necessary libraries
+library(data.table) # For efficient data manipulation
+library(ggplot2)    # For plotting
+library(zoo)        # For handling time series data
+library(xts)        # For time series analysis
+
+# Load the data from CSV
+data_kenya <- fread("kenya_lwe_final_analysis.csv")
+
+# Ensure 'date' column is of Date type
+data_kenya[, date := as.Date(date, format="%Y-%m-%d")]
+
+# Aggregate data by Date for time series analysis
+data_kenya_agg <- data_kenya[, .(LWE_Thickness = mean(lwe_thickness, na.rm = TRUE)), by = date]
+
+# Convert to xts object for time series analysis
+ts_data <- xts(data_kenya_agg$LWE_Thickness, order.by = data_kenya_agg$date)
+
+# Plot LWE Thickness Time Series
+ggplot(data_kenya_agg, aes(x = date, y = LWE_Thickness)) +
+  geom_line(color = "#0072B2", size = 0.8) + # Thinner line
+  geom_point(color = "#D55E00", size = 2.5) + # Brighter points
+  labs(
+    title = "Time Series of Liquid Water Equivalent (LWE) Thickness for Kenya",
+    subtitle = "From April 2002 to May 2024",
+    x = "Date",
+    y = "LWE Thickness (cm)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.background = element_rect(fill = "white"), # Clear background
+    panel.background = element_rect(fill = "white"), # Clear background for panel
+    panel.grid = element_blank(), # No grid lines
+    plot.title = element_text(face = "bold", size = 20),
+    plot.subtitle = element_text(size = 16),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "none"
+  ) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(limits = c(min(data_kenya_agg$LWE_Thickness, na.rm = TRUE) - 1, 
+                                max(data_kenya_agg$LWE_Thickness, na.rm = TRUE) + 1))
+
+# Save plot to file
+ggsave("LWE_Thickness_Time_Series_Kenya_Enhanced_Colors.png", width = 12, height = 6, dpi = 300)
+
+# Identify and handle anomalies if necessary
+# Example: values outside a certain range can be considered anomalies
+anomalies <- data_kenya_agg[LWE_Thickness < -10 | LWE_Thickness > 50]
+
+# Plot with anomalies highlighted
+ggplot(data_kenya_agg, aes(x = date, y = LWE_Thickness)) +
+  geom_line(color = "#0072B2", size = 0.8) + # Thinner line
+  geom_point(color = "#D55E00", size = 2.5) + # Brighter points
+  geom_point(data = anomalies, aes(x = date, y = LWE_Thickness), color = "#CC79A7", size = 3.5) + # Highlight anomalies in a different color
+  labs(
+    title = "LWE Thickness with Anomalies Highlighted for Kenya",
+    subtitle = "Anomalies are shown in pink",
+    x = "Date",
+    y = "LWE Thickness (cm)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.background = element_rect(fill = "white"), # Clear background
+    panel.background = element_rect(fill = "white"), # Clear background for panel
+    panel.grid = element_blank(), # No grid lines
+    plot.title = element_text(face = "bold", size = 20),
+    plot.subtitle = element_text(size = 16),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "none"
+  ) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(limits = c(min(data_kenya_agg$LWE_Thickness, na.rm = TRUE) - 1, 
+                                max(data_kenya_agg$LWE_Thickness, na.rm = TRUE) + 1))
+
+# Save plot to file
+ggsave("LWE_Thickness_Anomalies_Kenya_Enhanced_Colors.png", width = 12, height = 6, dpi = 300)
+
+# Print summary of the data
+print(summary(data_kenya_agg))
+
+
+
+
+
+
+
+
+
+
+
+############################################################lwe visualizations kenya
+
+
+# Load required libraries
+library(ggplot2)
+library(viridis)      # For color scales
+library(sf)           # For handling shapefiles
+library(data.table)   # For efficient data manipulation
+
+# Load Kenya shapefile (update the path if needed)
+kenya_map <- st_read("kenya.shp")
+
+# Load the data from CSV
+data_kenya <- fread("kenya_lwe_final_analysis.csv")
+
+# Ensure column names are correct
+setnames(data_kenya, old = c("date", "lwe_thickness"), new = c("Date", "LWE_Thickness"))
+
+# Ensure Date column is of Date type
+data_kenya[, Date := as.Date(Date, format="%Y-%m-%d")]
+
+# Convert data to an sf object for spatial operations
+data_kenya_sf <- st_as_sf(data_kenya, coords = c("lon", "lat"), crs = 4326)
+
+# Check the CRS of both data sources
+if (st_crs(data_kenya_sf) != st_crs(kenya_map)) {
+  kenya_map <- st_transform(kenya_map, st_crs(data_kenya_sf))
+}
+
+# Ensure geometries are valid
+data_kenya_sf <- st_make_valid(data_kenya_sf)
+kenya_map <- st_make_valid(kenya_map)
+
+# Perform spatial intersection
+data_kenya_clipped <- st_intersection(data_kenya_sf, kenya_map)
+
+# Add lon and lat columns if missing
+if (!("lon" %in% names(data_kenya_clipped)) || !("lat" %in% names(data_kenya_clipped))) {
+  coords_clipped <- st_coordinates(data_kenya_clipped)
+  data_kenya_clipped$lon <- coords_clipped[,1]
+  data_kenya_clipped$lat <- coords_clipped[,2]
+}
+
+# Convert back to a data.table for easier manipulation and plotting
+data_kenya_clipped <- as.data.table(st_drop_geometry(data_kenya_clipped))
+
+# Check the structure of the clipped data to confirm it has the necessary columns
+print(head(data_kenya_clipped))
+print(names(data_kenya_clipped))
+
+# Ensure columns lon, lat, Date, and LWE_Thickness are present
+if (!all(c("lon", "lat", "Date", "LWE_Thickness") %in% names(data_kenya_clipped))) {
+  stop("Error: One or more necessary columns are missing from the clipped data.")
+}
+
+# Aggregate data by Date and location
+data_kenya_agg <- data_kenya_clipped[, .(LWE_Thickness = mean(LWE_Thickness, na.rm = TRUE)), by = .(Date, lon, lat)]
+
+# Function to plot LWE Thickness data points on Kenya map within boundaries
+plot_LWE_map <- function(start_year, end_year) {
+  # Filter the dataset for the specified period
+  subset_data <- data_kenya_agg[Date >= as.Date(paste0(start_year, "-01-01")) &
+                                  Date <= as.Date(paste0(end_year, "-12-31"))]
+  
+  # Check if subset_data is empty
+  if (nrow(subset_data) == 0) {
+    stop("Error: No data available for the specified period.")
+  }
+  
+  # Check if Kenya shapefile has been loaded
+  if (!exists("kenya_map") || is.null(kenya_map)) {
+    stop("Error: Kenya shapefile has not been loaded.")
+  }
+  
+  # Plot the Kenya shapefile and overlay the LWE data points within boundaries
+  tryCatch({
+    plot <- ggplot() +
+      geom_sf(data = kenya_map, fill = "gray90", color = "black") +  # Kenya map outline
+      geom_point(data = subset_data, aes(x = lon, y = lat, color = LWE_Thickness), size = 3, alpha = 0.8, shape = 16) +  # Adjust size and shape for visibility
+      scale_color_viridis_c(option = "magma", name = "LWE Thickness (cm)", direction = -1) +  # Color scale improved with magma
+      labs(
+        title = paste("LWE Thickness in Kenya (", start_year, "-", end_year, ")", sep = ""),
+        x = "Longitude", y = "Latitude"
+      ) +
+      theme_minimal() +
+      theme(
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)
+      )
+    
+    # Save plot to file
+    ggsave(filename = paste0("LWE_Thickness_", start_year, "_", end_year, ".png"), plot = plot, width = 10, height = 8)
+    
+    print(plot)
+    
+  }, error = function(e) {
+    message("Error in plotting: ", e$message)
+  })
+}
+
+# Example usage to generate the plot for 2002-2006
+plot_2002_2006 <- plot_LWE_map(2002, 2006)
+plot_2007_2011 <- plot_LWE_map(2007, 2011)
+plot_2012_2016 <- plot_LWE_map(2012, 2016)
+plot_2017_2021 <- plot_LWE_map(2017, 2021)
+plot_2021_2024 <- plot_LWE_map(2021, 2024)
+# You can similarly generate other plots for different periods (e.g., 2007-2011, 2012-2016, etc.)
+
+
+##############################################################Mann Kendall Test, STL decomposition and Sen's slope
+
+# Load required libraries
+library(data.table)
+library(zoo)
+library(trend)
+library(forecast)
+library(ggplot2)
+library(Kendall)
+
+# Load the data
+data_kenya <- fread("kenya_lwe_final_analysis.csv")
+
+# Convert 'date' column to Date type
+data_kenya[, Date := as.Date(date, format="%Y-%m-%d")]
+
+# Aggregate the data by Date
+data_kenya_agg <- data_kenya[, .(LWE_Thickness = mean(lwe_thickness, na.rm = TRUE)), by = Date]
+
+# Perform the Mann-Kendall Test
+mk_test <- MannKendall(data_kenya_agg$LWE_Thickness)
+print(mk_test)
+
+# Perform STL decomposition
+stl_decomp <- stl(ts(data_kenya_agg$LWE_Thickness, frequency = 12), s.window = "periodic")
+
+# Plot STL decomposition
+stl_plot <- autoplot(stl_decomp) +
+  labs(title = "STL Decomposition of LWE Thickness",
+       x = "Time",
+       y = "LWE Thickness (cm)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),  # Neat outline
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Save the STL decomposition plot
+ggsave("stl_decomposition_lwe_thickness.png", plot = stl_plot, width = 10, height = 6)
+
+# Print the STL decomposition plot
+print(stl_plot)
+
+# Create a trend line plot for LWE Thickness
+trend_plot <- ggplot(data_kenya_agg, aes(x = Date, y = LWE_Thickness)) +
+  geom_line(color = "dodgerblue", size = 1.5, linetype = "solid") + 
+  geom_smooth(method = "lm", color = "tomato", size = 1.2, se = FALSE) +
+  labs(title = "LWE Thickness Trend in Kenya",
+       x = "Date",
+       y = "LWE Thickness (cm)",
+       color = "Trend") +  # Legend title
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)  # Neat outline
+  )
+
+# Save the trend plot
+ggsave("lwe_thickness_trend_kenya.png", plot = trend_plot, width = 10, height = 6)
+
+# Print the trend plot
+print(trend_plot)
+
+
+
+
+
+######################################################################################### splitting grace data
+
+# Load necessary library
+library(dplyr)
+
+# Read the dataset
+data <- read.csv("kenya_lwe_final_analysis.csv")
+
+# Convert the 'date' column to Date format, assuming it's in 'YYYY-MM-DD' format
+data$date <- as.Date(data$date)
+
+# Extract year from 'date' column
+data$year <- format(data$date, "%Y")
+
+# Loop over each year and save the corresponding data
+for (year in unique(data$year)) {
+  # Filter data for the specific year
+  yearly_data <- data %>% filter(year == !!year) %>%
+    select(lon, lat, date, lwe_thickness)  # Select required columns
+  
+  # Define the filename
+  filename <- paste0("kenya_lwe_", year, ".csv")
+  
+  # Write to CSV
+  write.csv(yearly_data, file = filename, row.names = FALSE)
+}
+
+
+
+
+################################################################################# lat and lon columns to the nearest 0.5
+
+
+
+
+
+# Loop through each year from 2002 to 2024
+for (year in 2002:2024) {
+  # Construct the filename for each year
+  filename <- paste0("kenya_lwe_", year, ".csv")
+  
+  # Check if the file exists
+  if (file.exists(filename)) {
+    # Read the dataset for the specific year
+    data <- read.csv(filename)
+    
+    # Round the 'lat' and 'lon' columns to the nearest 0.5
+    data$lat <- round(data$lat * 2) / 2
+    data$lon <- round(data$lon * 2) / 2
+    
+    # Overwrite the original file with the modified dataset
+    write.csv(data, file = filename, row.names = FALSE)
+    
+    # Print a message indicating success
+    cat("Modified and saved:", filename, "\n")
+  } else {
+    cat("File not found:", filename, "\n")
+  }
+}
+
+
+
+
